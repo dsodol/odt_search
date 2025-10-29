@@ -167,8 +167,8 @@ public class OdtSearchApp extends JFrame {
         setTitle("Document Search Tool — " + rootPath.toAbsolutePath());
         logWindow.log("Root set to: " + rootPath);
         DefaultMutableTreeNode rootNode = new DefaultMutableTreeNode(new FileNode(rootPath));
-        // add a dummy child for lazy loading
-        rootNode.add(new DefaultMutableTreeNode("loading"));
+        // Eagerly populate root children so the tree isn't stuck showing just a placeholder
+        loadChildren(rootNode);
         fileTree.setModel(new DefaultTreeModel(rootNode));
         ((DefaultTreeModel) fileTree.getModel()).reload();
         fileTree.expandPath(new TreePath(rootNode.getPath()));
@@ -240,6 +240,28 @@ public class OdtSearchApp extends JFrame {
         StringWriter sw = new StringWriter();
         t.printStackTrace(new PrintWriter(sw));
         return sw.toString();
+    }
+
+    // Populate a directory node with its immediate subdirectories (adds a placeholder child for lazy loading)
+    private void loadChildren(DefaultMutableTreeNode node) {
+        Object uo = node.getUserObject();
+        if (!(uo instanceof FileNode)) return;
+        FileNode fn = (FileNode) uo;
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(fn.path)) {
+            java.util.List<DefaultMutableTreeNode> children = new ArrayList<>();
+            for (Path p : ds) {
+                if (Files.isDirectory(p)) {
+                    DefaultMutableTreeNode child = new DefaultMutableTreeNode(new FileNode(p));
+                    // add a dummy child so it can be expanded lazily later
+                    child.add(new DefaultMutableTreeNode("loading"));
+                    children.add(child);
+                }
+            }
+            children.sort(Comparator.comparing(a -> ((FileNode) a.getUserObject()).path.getFileName().toString().toLowerCase()));
+            for (DefaultMutableTreeNode c : children) node.add(c);
+        } catch (IOException ex) {
+            logWindow.log("Failed to list directory: " + ex.getMessage());
+        }
     }
 
     // Lazy loading directory tree
