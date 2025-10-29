@@ -1,6 +1,7 @@
 import javax.swing.*;
 import javax.swing.event.TreeExpansionEvent;
 import javax.swing.event.TreeWillExpandListener;
+import javax.swing.event.TreeSelectionListener;
 import javax.swing.table.DefaultTableModel;
 import javax.swing.tree.DefaultMutableTreeNode;
 import javax.swing.tree.DefaultTreeModel;
@@ -11,6 +12,8 @@ import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -18,6 +21,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.*;
 import java.util.concurrent.CancellationException;
+import java.util.prefs.Preferences;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.awt.image.BufferedImage;
@@ -39,7 +43,7 @@ import javax.xml.parsers.DocumentBuilderFactory;
  * No external libraries are required. ODT files are read as ZIP archives and their content.xml is parsed via JAXP.
  */
 public class OdtSearchApp extends JFrame {
-    private final JTextField searchField = new JTextField();
+    private final JComboBox<String> searchCombo = new JComboBox<>();
     private final JButton searchButton = new JButton("Search");
     private final JButton stopButton = new JButton("Stop");
     private final JButton chooseRootButton = new JButton("Choose Root…");
@@ -55,6 +59,13 @@ public class OdtSearchApp extends JFrame {
     private final JTree fileTree = new JTree();
     private Path rootPath = Paths.get(System.getProperty("user.home"));
 
+    // Preferences and search history
+    private final Preferences prefs = Preferences.userNodeForPackage(OdtSearchApp.class);
+    private static final String PREF_LAST_ROOT = "lastRoot";
+    private static final String PREF_LAST_SELECTED = "lastSelectedDir";
+    private static final String PREF_HISTORY = "searchHistory";
+    private final java.util.List<String> searchHistory = new ArrayList<>();
+
     private SearchWorker currentWorker;
     private final LogWindow logWindow = new LogWindow();
 
@@ -67,6 +78,23 @@ public class OdtSearchApp extends JFrame {
         initUI();
         initActions();
 
+        // Load preferences: last root and history
+        try {
+            String lastRoot = prefs.get(PREF_LAST_ROOT, null);
+            if (lastRoot != null) {
+                Path p = Paths.get(lastRoot);
+                if (Files.isDirectory(p)) {
+                    rootPath = p;
+                } else {
+                    // Clear invalid stored path to avoid confusion next time
+                    try { prefs.remove(PREF_LAST_ROOT); prefs.flush(); } catch (Exception ignore2) {}
+                }
+            }
+            loadHistoryFromPrefs();
+            refreshSearchComboModel();
+        } catch (Exception ignore) {
+        }
+
         // Set application icon images (multi-size) generated programmatically
         try {
             setIconImages(IconFactory.createAppIcons());
@@ -74,7 +102,8 @@ public class OdtSearchApp extends JFrame {
             // Fallback silently; app will still run without custom icon
         }
 
-        SwingUtilities.invokeLater(() -> setRoot(rootPath));
+        Path toSet = rootPath; // capture effectively final
+        SwingUtilities.invokeLater(() -> setRoot(toSet));
     }
 
     private void initUI() {
@@ -82,8 +111,13 @@ public class OdtSearchApp extends JFrame {
         JPanel controls = new JPanel(new BorderLayout(8, 8));
         JPanel leftControls = new JPanel(new FlowLayout(FlowLayout.LEFT));
         leftControls.add(new JLabel("Search term:"));
-        searchField.setColumns(30);
-        leftControls.add(searchField);
+        searchCombo.setEditable(true);
+        // Set a reasonable width for the editor component
+        Component editorComp = searchCombo.getEditor().getEditorComponent();
+        if (editorComp instanceof JTextField) {
+            ((JTextField) editorComp).setColumns(30);
+        }
+        leftControls.add(searchCombo);
         leftControls.add(searchButton);
         leftControls.add(stopButton);
         stopButton.setEnabled(false);
@@ -133,14 +167,43 @@ public class OdtSearchApp extends JFrame {
         stopButton.addActionListener(this::onStopSearch);
         openLogButton.addActionListener(e -> logWindow.setVisible(true));
 
-        resultsTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                int row = resultsTable.getSelectedRow();
-                if (row >= 0) {
-                    int modelRow = resultsTable.convertRowIndexToModel(row);
-                    String path = (String) resultsModel.getValueAt(modelRow, 0);
-                    // Optionally open the file in system default app
-                    // Desktop.getDesktop().open(new File(path));
+        // Pressing Enter or selecting an item in the search combo starts the search
+        searchCombo.addActionListener(this::onStartSearch);
+        Component ed2 = searchCombo.getEditor().getEditorComponent();
+        if (ed2 instanceof JTextField) {
+            ((JTextField) ed2).addActionListener(this::onStartSearch);
+        }
+
+        // Persist last selected directory when tree selection changes
+        fileTree.addTreeSelectionListener(e -> {
+            TreePath sel = fileTree.getSelectionPath();
+            if (sel == null) return;
+            Object last = ((DefaultMutableTreeNode) sel.getLastPathComponent()).getUserObject();
+            if (last instanceof FileNode) {
+                Path p = ((FileNode) last).path;
+                try {
+                    if (Files.isDirectory(p)) {
+                        prefs.put(PREF_LAST_SELECTED, p.toAbsolutePath().toString());
+                        prefs.flush();
+                    }
+                } catch (Exception ignore) {}
+            }
+        });
+
+        // Double-click a result row to open the document
+        resultsTable.addMouseListener(new MouseAdapter() {
+            @Override public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2 && SwingUtilities.isLeftMouseButton(e)) {
+                    int row = resultsTable.rowAtPoint(e.getPoint());
+                    if (row >= 0) {
+                        int modelRow = resultsTable.convertRowIndexToModel(row);
+                        String path = (String) resultsModel.getValueAt(modelRow, 0);
+                        try {
+                            Desktop.getDesktop().open(new File(path));
+                        } catch (Exception ex) {
+                            JOptionPane.showMessageDialog(OdtSearchApp.this, "Cannot open file:\n" + path + "\n" + ex.getMessage(), "Open Error", JOptionPane.ERROR_MESSAGE);
+                        }
+                    }
                 }
             }
         });
@@ -148,6 +211,9 @@ public class OdtSearchApp extends JFrame {
         addWindowListener(new WindowAdapter() {
             @Override public void windowClosing(WindowEvent e) {
                 if (currentWorker != null && !currentWorker.isDone()) currentWorker.cancel(true);
+                try { prefs.flush(); } catch (Exception ex1) {
+                    try { prefs.sync(); } catch (Exception ex2) { /* ignore */ }
+                }
             }
         });
     }
@@ -164,6 +230,11 @@ public class OdtSearchApp extends JFrame {
 
     private void setRoot(Path newRoot) {
         this.rootPath = newRoot;
+        // persist last directory
+        try {
+            prefs.put(PREF_LAST_ROOT, rootPath.toAbsolutePath().toString());
+            prefs.flush();
+        } catch (Exception ignore) {}
         setTitle("Document Search Tool — " + rootPath.toAbsolutePath());
         logWindow.log("Root set to: " + rootPath);
         DefaultMutableTreeNode rootNode = new DefaultMutableTreeNode(new FileNode(rootPath));
@@ -171,19 +242,70 @@ public class OdtSearchApp extends JFrame {
         loadChildren(rootNode);
         fileTree.setModel(new DefaultTreeModel(rootNode));
         ((DefaultTreeModel) fileTree.getModel()).reload();
-        fileTree.expandPath(new TreePath(rootNode.getPath()));
+        TreePath rootTreePath = new TreePath(rootNode.getPath());
+        fileTree.expandPath(rootTreePath);
+
+        // Try to restore last selected directory (under this root)
+        restoreLastSelectedDirectory();
     }
+
+    // ===== Search history helpers =====
+    private void loadHistoryFromPrefs() {
+        searchHistory.clear();
+        String raw = prefs.get(PREF_HISTORY, "");
+        if (raw != null && !raw.isEmpty()) {
+            String[] items = raw.split("\n");
+            for (String s : items) {
+                String term = s.trim();
+                if (!term.isEmpty()) searchHistory.add(term);
+            }
+        }
+    }
+
+    private void saveHistoryToPrefs() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < searchHistory.size(); i++) {
+            if (i > 0) sb.append('\n');
+            // sanitize newlines just in case
+            sb.append(searchHistory.get(i).replace('\n', ' '));
+        }
+        try { prefs.put(PREF_HISTORY, sb.toString()); } catch (Exception ignore) {}
+    }
+
+    private void refreshSearchComboModel() {
+        DefaultComboBoxModel<String> model = new DefaultComboBoxModel<>(searchHistory.toArray(new String[0]));
+        searchCombo.setModel(model);
+        searchCombo.setEditable(true);
+    }
+
+    private void addToHistory(String term) {
+        // move to front, unique, cap at 20
+        searchHistory.remove(term);
+        searchHistory.add(0, term);
+        while (searchHistory.size() > 20) searchHistory.remove(searchHistory.size() - 1);
+    }
+
 
     private void onStartSearch(ActionEvent e) {
         if (currentWorker != null && !currentWorker.isDone()) {
             JOptionPane.showMessageDialog(this, "A search is already running.", "Busy", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        String term = searchField.getText().trim();
+        String term = "";
+        Component ed = searchCombo.getEditor().getEditorComponent();
+        if (ed instanceof JTextField) term = ((JTextField) ed).getText().trim();
+        else if (searchCombo.getSelectedItem() != null) term = searchCombo.getSelectedItem().toString().trim();
         if (term.isEmpty()) {
             JOptionPane.showMessageDialog(this, "Enter a search term.", "Validation", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
+
+        // maintain search history and refresh combo model
+        addToHistory(term);
+        saveHistoryToPrefs();
+        refreshSearchComboModel();
+        searchCombo.setSelectedItem(term);
+
         // Determine selected directory from tree; if none, use root
         Path startDir = rootPath;
         TreePath sel = fileTree.getSelectionPath();
@@ -870,4 +992,101 @@ public class OdtSearchApp extends JFrame {
             new OdtSearchApp().setVisible(true);
         });
     }
+
+    // ===== Selection persistence =====
+    private void restoreLastSelectedDirectory() {
+        String lastSel = null;
+        try { lastSel = prefs.get(PREF_LAST_SELECTED, null); } catch (Exception ignore) {}
+        DefaultMutableTreeNode rootNode = (DefaultMutableTreeNode) fileTree.getModel().getRoot();
+        if (rootNode == null) return;
+        // Default to root selection
+        Runnable selectRoot = () -> {
+            TreePath tp = new TreePath(rootNode.getPath());
+            fileTree.setSelectionPath(tp);
+            fileTree.scrollPathToVisible(tp);
+        };
+        if (lastSel == null || lastSel.isEmpty()) {
+            selectRoot.run();
+            return;
+        }
+        Path target;
+        try {
+            target = Paths.get(lastSel);
+        } catch (Exception ex) {
+            selectRoot.run();
+            return;
+        }
+        try {
+            if (!Files.isDirectory(target)) { selectRoot.run(); return; }
+            Path absRoot = rootPath.toAbsolutePath().normalize();
+            Path absTarget = target.toAbsolutePath().normalize();
+            if (!absTarget.startsWith(absRoot)) { selectRoot.run(); return; }
+            boolean ok = selectPathInTree(absTarget);
+            if (!ok) selectRoot.run();
+        } catch (Exception ex) {
+            selectRoot.run();
+        }
+    }
+
+    private boolean selectPathInTree(Path absTarget) {
+        try {
+            DefaultTreeModel model = (DefaultTreeModel) fileTree.getModel();
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) model.getRoot();
+            if (node == null) return false;
+            FileNode fnRoot = (FileNode) node.getUserObject();
+            Path absRoot = fnRoot.path.toAbsolutePath().normalize();
+            if (absTarget.equals(absRoot)) {
+                TreePath tp = new TreePath(node.getPath());
+                fileTree.setSelectionPath(tp);
+                fileTree.scrollPathToVisible(tp);
+                return true;
+            }
+            Path rel = absRoot.relativize(absTarget);
+            for (Path name : rel) {
+                // Ensure children are loaded for current node
+                ensureChildrenLoaded(node, model);
+                DefaultMutableTreeNode next = null;
+                for (int i = 0; i < node.getChildCount(); i++) {
+                    DefaultMutableTreeNode ch = (DefaultMutableTreeNode) node.getChildAt(i);
+                    Object uo = ch.getUserObject();
+                    if (uo instanceof FileNode) {
+                        Path p = ((FileNode) uo).path.getFileName();
+                        if (p != null && p.toString().equalsIgnoreCase(name.toString())) {
+                            next = ch; break;
+                        }
+                    }
+                }
+                if (next == null) return false;
+                node = next;
+                // Expand path as we go
+                TreePath tp = new TreePath(node.getPath());
+                fileTree.expandPath(tp);
+            }
+            TreePath tp = new TreePath(node.getPath());
+            fileTree.setSelectionPath(tp);
+            fileTree.scrollPathToVisible(tp);
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    private void ensureChildrenLoaded(DefaultMutableTreeNode node, DefaultTreeModel model) {
+        if (node.getChildCount() == 1 && ((DefaultMutableTreeNode) node.getFirstChild()).getUserObject() instanceof String) {
+            // Placeholder present: replace with real children
+            node.removeAllChildren();
+            Object uo = node.getUserObject();
+            if (uo instanceof FileNode) {
+                loadChildren(node);
+            }
+            model.reload(node);
+        } else if (node.getChildCount() == 0) {
+            Object uo = node.getUserObject();
+            if (uo instanceof FileNode) {
+                loadChildren(node);
+                model.reload(node);
+            }
+        }
+    }
+
 }
