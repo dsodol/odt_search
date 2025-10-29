@@ -19,7 +19,6 @@ bin/
 ### NetBeans ###
 /nbproject/private/
 /nbbuild/
-/dist/
 /nbdist/
 /.nb-gradle/
 
@@ -28,3 +27,5 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+*.class
