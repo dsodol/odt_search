@@ -18,6 +18,7 @@ Coming soon.
 - Windows 10/11 (for the provided packaging scripts)
 - Java JDK 17 or newer (to build or run from source). JRE is sufficient for running the packaged app.
 - Optional for MSI packaging: WiX Toolset v3.x (puts `candle.exe` and `light.exe` on PATH)
+- No Microsoft Office or LibreOffice required for searching — the app reads ODT/DOCX/XLSX files directly using the JDK. To open a result by double‑clicking, any associated app works (e.g., LibreOffice or Microsoft Office), but it’s optional.
 
 ## Quick Start (End Users)
 Prebuilt artifacts are placed under `dist/` when you package the app.

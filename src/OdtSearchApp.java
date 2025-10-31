@@ -55,6 +55,14 @@ public class OdtSearchApp extends JFrame {
         @Override
         public boolean isCellEditable(int row, int column) { return false; }
     };
+    // Track files already shown in the results to avoid duplicates
+    private final Map<String, Integer> fileRowIndex = new HashMap<>();
+
+    // Search option controls
+    private final JCheckBox exactPhraseCheck = new JCheckBox("Exact phrase");
+    private final JCheckBox ignoreSpacesCheck = new JCheckBox("Ignore spaces");
+    private final JCheckBox proximityCheck = new JCheckBox("Proximity");
+    private final JSpinner proximitySpinner = new JSpinner(new SpinnerNumberModel(3, 1, 10, 1));
 
     private final JTree fileTree = new JTree();
     private Path rootPath = Paths.get(System.getProperty("user.home"));
@@ -64,10 +72,34 @@ public class OdtSearchApp extends JFrame {
     private static final String PREF_LAST_ROOT = "lastRoot";
     private static final String PREF_LAST_SELECTED = "lastSelectedDir";
     private static final String PREF_HISTORY = "searchHistory";
+    private static final String PREF_OPT_EXACT = "optExactPhrase";
+    private static final String PREF_OPT_IGNORE_SPACES = "optIgnoreSpaces";
+    private static final String PREF_OPT_PROX = "optProximity";
+    private static final String PREF_OPT_PROX_N = "optProximityN";
     private final java.util.List<String> searchHistory = new ArrayList<>();
 
     private SearchWorker currentWorker;
     private final LogWindow logWindow = new LogWindow();
+
+    // Search options data holder
+    private static class SearchOptions {
+        final boolean exactPhrase;
+        final boolean ignoreSpaces;
+        final boolean proximity;
+        final int proximityN;
+        SearchOptions(boolean exactPhrase, boolean ignoreSpaces, boolean proximity, int proximityN) {
+            this.exactPhrase = exactPhrase;
+            this.ignoreSpaces = ignoreSpaces;
+            this.proximity = proximity;
+            this.proximityN = proximityN;
+        }
+        String summary() {
+            if (proximity) return "proximity<=" + proximityN;
+            if (exactPhrase && ignoreSpaces) return "exact phrase (ignore spaces)";
+            if (exactPhrase) return "exact phrase";
+            return "substring";
+        }
+    }
 
     public OdtSearchApp() {
         super("Document Search Tool");
@@ -92,6 +124,14 @@ public class OdtSearchApp extends JFrame {
             }
             loadHistoryFromPrefs();
             refreshSearchComboModel();
+            // Load search options
+            exactPhraseCheck.setSelected(prefs.getBoolean(PREF_OPT_EXACT, true));
+            ignoreSpacesCheck.setSelected(prefs.getBoolean(PREF_OPT_IGNORE_SPACES, false));
+            boolean prox = prefs.getBoolean(PREF_OPT_PROX, false);
+            proximityCheck.setSelected(prox);
+            int pn = Math.max(1, Math.min(10, prefs.getInt(PREF_OPT_PROX_N, 3)));
+            proximitySpinner.setValue(pn);
+            proximitySpinner.setEnabled(prox);
         } catch (Exception ignore) {
         }
 
@@ -122,11 +162,29 @@ public class OdtSearchApp extends JFrame {
         leftControls.add(stopButton);
         stopButton.setEnabled(false);
 
+        // Options panel
+        JPanel optionsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        exactPhraseCheck.setToolTipText("Match the phrase exactly (case-insensitive)");
+        ignoreSpacesCheck.setToolTipText("Treat whitespace as optional");
+        proximityCheck.setToolTipText("Match words within N-word distance, in order");
+        proximitySpinner.setToolTipText("Max distance between adjacent words");
+        optionsPanel.add(exactPhraseCheck);
+        optionsPanel.add(ignoreSpacesCheck);
+        optionsPanel.add(proximityCheck);
+        optionsPanel.add(new JLabel("N:"));
+        optionsPanel.add(proximitySpinner);
+        proximitySpinner.setEnabled(false);
+
+        JPanel leftStack = new JPanel();
+        leftStack.setLayout(new BoxLayout(leftStack, BoxLayout.Y_AXIS));
+        leftStack.add(leftControls);
+        leftStack.add(optionsPanel);
+
         JPanel rightControls = new JPanel(new FlowLayout(FlowLayout.RIGHT));
         rightControls.add(chooseRootButton);
         rightControls.add(openLogButton);
 
-        controls.add(leftControls, BorderLayout.WEST);
+        controls.add(leftStack, BorderLayout.WEST);
         controls.add(rightControls, BorderLayout.EAST);
 
         // Left panel: directory tree
@@ -167,12 +225,13 @@ public class OdtSearchApp extends JFrame {
         stopButton.addActionListener(this::onStopSearch);
         openLogButton.addActionListener(e -> logWindow.setVisible(true));
 
-        // Pressing Enter or selecting an item in the search combo starts the search
+        // Start search when user presses Enter in the combo editor OR selects an item.
+        // Note: Only attach to the combo box itself. Attaching a listener to the editor's
+        // JTextField as well causes duplicate ActionEvents and triggers the "A search is already running" warning.
         searchCombo.addActionListener(this::onStartSearch);
-        Component ed2 = searchCombo.getEditor().getEditorComponent();
-        if (ed2 instanceof JTextField) {
-            ((JTextField) ed2).addActionListener(this::onStartSearch);
-        }
+
+        // Enable/disable proximity spinner based on checkbox
+        proximityCheck.addItemListener(e2 -> proximitySpinner.setEnabled(proximityCheck.isSelected()));
 
         // Persist last selected directory when tree selection changes
         fileTree.addTreeSelectionListener(e -> {
@@ -317,12 +376,41 @@ public class OdtSearchApp extends JFrame {
         }
 
         resultsModel.setRowCount(0);
+        fileRowIndex.clear();
         searchButton.setEnabled(false);
         stopButton.setEnabled(true);
+        // Build a short status with options summary
         statusLabel.setText("Searching…");
         logWindow.log("Starting search for '" + term + "' in " + startDir);
 
-        currentWorker = new SearchWorker(startDir, term, this::onResult, this::onProgress, this::onCompleted, logWindow);
+        // Build search options
+        boolean optProx = proximityCheck.isSelected();
+        boolean optExact = exactPhraseCheck.isSelected();
+        boolean optIgnoreSpaces = ignoreSpacesCheck.isSelected();
+        int proxN = (int) proximitySpinner.getValue();
+        if (optProx) { // proximity overrides other modes
+            optExact = false;
+            optIgnoreSpaces = false;
+        }
+        SearchOptions options = new SearchOptions(optExact, optIgnoreSpaces, optProx, proxN);
+        // persist options
+        try {
+            prefs.putBoolean(PREF_OPT_EXACT, optExact);
+            prefs.putBoolean(PREF_OPT_IGNORE_SPACES, optIgnoreSpaces);
+            prefs.putBoolean(PREF_OPT_PROX, optProx);
+            prefs.putInt(PREF_OPT_PROX_N, proxN);
+            prefs.flush();
+        } catch (Exception ignore) {}
+
+        // Disable option controls during search
+        exactPhraseCheck.setEnabled(false);
+        ignoreSpacesCheck.setEnabled(false);
+        proximityCheck.setEnabled(false);
+        proximitySpinner.setEnabled(false);
+
+        logWindow.log("Options: " + options.summary());
+
+        currentWorker = new SearchWorker(startDir, term, options, this::onResult, this::onProgress, this::onCompleted, logWindow);
         currentWorker.execute();
     }
 
@@ -336,7 +424,23 @@ public class OdtSearchApp extends JFrame {
     }
 
     private void onResult(SearchResult r) {
-        resultsModel.addRow(new Object[]{r.file.toString(), r.matchCount, r.snippet});
+        String pathStr = r.file.toAbsolutePath().toString();
+        String osName = System.getProperty("os.name");
+        if (osName != null && osName.toLowerCase(Locale.ROOT).contains("win")) {
+            pathStr = pathStr.toLowerCase(Locale.ROOT);
+        }
+        Integer existingRow = fileRowIndex.get(pathStr);
+        if (existingRow != null) {
+            // Update the existing row: accumulate match count, keep the first snippet
+            Object oldVal = resultsModel.getValueAt(existingRow, 1);
+            int oldCount = 0;
+            if (oldVal instanceof Number) oldCount = ((Number) oldVal).intValue();
+            resultsModel.setValueAt(oldCount + r.matchCount, existingRow, 1);
+        } else {
+            resultsModel.addRow(new Object[]{r.file.toString(), r.matchCount, r.snippet});
+            int newRow = resultsModel.getRowCount() - 1;
+            fileRowIndex.put(pathStr, newRow);
+        }
     }
 
     private void onProgress(String message) {
@@ -346,6 +450,11 @@ public class OdtSearchApp extends JFrame {
     private void onCompleted(Throwable error, boolean cancelled, long filesScanned, long matchesFound, long elapsedMillis) {
         searchButton.setEnabled(true);
         stopButton.setEnabled(false);
+        // Re-enable option controls
+        exactPhraseCheck.setEnabled(true);
+        ignoreSpacesCheck.setEnabled(true);
+        proximityCheck.setEnabled(true);
+        proximitySpinner.setEnabled(proximityCheck.isSelected());
         if (cancelled) {
             statusLabel.setText("Cancelled. Scanned " + filesScanned + " files, found " + matchesFound + " matches.");
             logWindow.log("Search cancelled. Files scanned: " + filesScanned + ", matches: " + matchesFound + ".");
@@ -429,6 +538,7 @@ public class OdtSearchApp extends JFrame {
     private static class SearchWorker extends SwingWorker<Void, SearchResult> {
         private final Path startDir;
         private final String termLower;
+        private final SearchOptions options;
         private final java.util.function.Consumer<SearchResult> onResult;
         private final java.util.function.Consumer<String> onProgress;
         private final CompletionCallback onCompleted;
@@ -439,10 +549,13 @@ public class OdtSearchApp extends JFrame {
         private long lastProgressUpdate = 0L;
         private final long startTime = System.currentTimeMillis();
 
-        SearchWorker(Path startDir, String term, java.util.function.Consumer<SearchResult> onResult,
-                     java.util.function.Consumer<String> onProgress, CompletionCallback onCompleted, LogWindow logger) {
+        SearchWorker(Path startDir, String term, SearchOptions options,
+                     java.util.function.Consumer<SearchResult> onResult,
+                     java.util.function.Consumer<String> onProgress,
+                     CompletionCallback onCompleted, LogWindow logger) {
             this.startDir = startDir;
             this.termLower = term.toLowerCase(Locale.ROOT);
+            this.options = options;
             this.onResult = onResult;
             this.onProgress = onProgress;
             this.onCompleted = onCompleted;
@@ -507,12 +620,12 @@ public class OdtSearchApp extends JFrame {
 
         private void handleTextResult(Path file, String text) {
             if (text == null) return;
-            int count = countOccurrences(text, termLower);
-            if (count > 0) {
-                matchesFound += count;
-                String snippet = makeSnippet(text, termLower, 200);
-                publish(new SearchResult(file, count, snippet));
-                logger.log("Match in: " + file + " (" + count + ")");
+            MatchResult mr = computeMatches(text, termLower, options);
+            if (mr.count > 0) {
+                matchesFound += mr.count;
+                String snippet = makeSnippet(text, mr.firstStart, mr.firstEnd, 200);
+                publish(new SearchResult(file, mr.count, snippet));
+                logger.log("Match in: " + file + " (" + mr.count + ")");
             }
         }
 
@@ -547,6 +660,144 @@ public class OdtSearchApp extends JFrame {
             return count;
         }
 
+        // Result of matching: total count and the first match range [firstStart, firstEnd)
+        private static class MatchResult {
+            final int count;
+            final int firstStart;
+            final int firstEnd;
+            MatchResult(int count, int firstStart, int firstEnd) {
+                this.count = count;
+                this.firstStart = firstStart;
+                this.firstEnd = firstEnd;
+            }
+        }
+
+        private static class Token {
+            final String word;
+            final int start;
+            final int end;
+            Token(String word, int start, int end) {
+                this.word = word;
+                this.start = start;
+                this.end = end;
+            }
+        }
+
+        private static java.util.List<Token> tokenize(String textLower) {
+            java.util.List<Token> out = new ArrayList<>();
+            int n = textLower.length();
+            int i = 0;
+            while (i < n) {
+                // skip non-word
+                while (i < n && !Character.isLetterOrDigit(textLower.charAt(i))) i++;
+                if (i >= n) break;
+                int start = i;
+                while (i < n && Character.isLetterOrDigit(textLower.charAt(i))) i++;
+                int end = i;
+                String w = textLower.substring(start, end);
+                out.add(new Token(w, start, end));
+            }
+            return out;
+        }
+
+        private static MatchResult computeMatches(String text, String termLower, SearchOptions options) {
+            if (text == null || termLower == null || termLower.isEmpty()) return new MatchResult(0, -1, -1);
+            String lower = text.toLowerCase(Locale.ROOT);
+            if (options.proximity) {
+                // Proximity search: words within N in order
+                String[] qwordsArr = termLower.split("[^\\p{L}\\p{N}]+");
+                java.util.List<String> qwords = new ArrayList<>();
+                for (String q : qwordsArr) { if (!q.isEmpty()) qwords.add(q); }
+                if (qwords.isEmpty()) return new MatchResult(0, -1, -1);
+                java.util.List<Token> tokens = tokenize(lower);
+                int count = 0; int firstStart = -1; int firstEnd = -1;
+                int n = tokens.size();
+                for (int i = 0; i < n; i++) {
+                    if (!tokens.get(i).word.equals(qwords.get(0))) continue;
+                    int idx = i; int lastIdx = i; boolean ok = true;
+                    for (int qi = 1; qi < qwords.size(); qi++) {
+                        String target = qwords.get(qi);
+                        boolean found = false;
+                        int limit = options.proximityN;
+                        int searched = 0;
+                        int j = lastIdx + 1;
+                        while (j < n && searched <= limit) {
+                            if (tokens.get(j).word.equals(target)) { found = true; break; }
+                            j++; searched++;
+                        }
+                        if (!found) { ok = false; break; }
+                        lastIdx = j;
+                    }
+                    if (ok) {
+                        count++;
+                        int s = tokens.get(i).start;
+                        int e = tokens.get(lastIdx).end;
+                        if (firstStart < 0) { firstStart = s; firstEnd = e; }
+                        // continue search after this match to avoid overlapping starting at same i
+                        i = lastIdx; // advance i to end of this match
+                    }
+                }
+                return new MatchResult(count, firstStart, firstEnd);
+            } else if (options.exactPhrase && options.ignoreSpaces) {
+                // Two-pointer search ignoring whitespace in haystack
+                String pattern = termLower.replaceAll("\\s+", "");
+                if (pattern.isEmpty()) return new MatchResult(0, -1, -1);
+                int n = lower.length();
+                int m = pattern.length();
+                int i = 0; int count = 0; int firstStart = -1; int firstEnd = -1;
+                while (i < n) {
+                    int tempI = i; int j = 0; int start = -1;
+                    while (tempI < n && j < m) {
+                        char ch = lower.charAt(tempI);
+                        if (Character.isWhitespace(ch)) { tempI++; continue; }
+                        if (ch == pattern.charAt(j)) {
+                            if (start < 0) start = tempI;
+                            tempI++; j++;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (j == m) {
+                        count++;
+                        if (firstStart < 0) { firstStart = start; firstEnd = tempI; }
+                        i = tempI; // non-overlapping
+                    } else {
+                        i++;
+                    }
+                }
+                return new MatchResult(count, firstStart, firstEnd);
+            } else {
+                // Simple substring search
+                int count = 0; int firstStart = -1; int firstEnd = -1;
+                int idx = 0;
+                while ((idx = lower.indexOf(termLower, idx)) >= 0) {
+                    if (firstStart < 0) { firstStart = idx; firstEnd = idx + termLower.length(); }
+                    count++;
+                    idx += termLower.length();
+                }
+                return new MatchResult(count, firstStart, firstEnd);
+            }
+        }
+
+        private static String makeSnippet(String text, int matchStart, int matchEnd, int maxLen) {
+            if (text == null || text.isEmpty()) return "";
+            if (matchStart < 0 || matchEnd < 0 || matchStart >= text.length()) {
+                // fallback to beginning
+                return text.substring(0, Math.min(maxLen, text.length())).replaceAll("\n+", " ");
+            }
+            int mid = (matchStart + matchEnd) / 2;
+            int start = Math.max(0, mid - maxLen / 2);
+            int end = Math.min(text.length(), start + maxLen);
+            // ensure we cover the match
+            if (matchStart < start) start = Math.max(0, matchStart - 10);
+            if (matchEnd > end) end = Math.min(text.length(), matchEnd + 10);
+            String snippet = text.substring(start, end).replaceAll("\n+", " ");
+            if (start > 0) snippet = "…" + snippet;
+            if (end < text.length()) snippet = snippet + "…";
+            return snippet;
+        }
+
+        // legacy snippet helper kept for backward compatibility
         private static String makeSnippet(String text, String needleLower, int maxLen) {
             if (text == null || text.isEmpty()) return "";
             String lower = text.toLowerCase(Locale.ROOT);
